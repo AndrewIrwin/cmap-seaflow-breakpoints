@@ -1,0 +1,149 @@
+---
+title: "CMAP seaflow"
+author: "Andrew Irwin"
+date: "16/10/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## setup
+
+```{r}
+library(DBI)
+library(odbc)
+library(tidyverse)
+library(dbplyr)
+library(mclust)
+```
+
+Unstall cmap4r
+```{r}
+# devtools::install_github("simonscmap/cmap4r/package/cmap4r")
+library(cmap4r)
+```
+
+Read some data
+```{r}
+downloadData = FALSE
+if (downloadData) {   
+# con <- connect_cmap(Driver = "libtdsodbc.so", reset=TRUE) # need credentials
+# airwin / diatom1355! -- not working
+# how to use API key?
+
+table.name <- "tblSeaFlow" # table name
+# temporary solution, pending revision to code
+seaflow <- cmap4r:::query(paste("select * from", table.name), "de2c7320-f06c-11e9-aaf9-bbb395927ec4")
+
+# tbl.colClass <- tbl_vartpe(con, table.name)
+# sel.var <- ""
+# range.var <- tbl_spacetime_range(con, table.name)
+
+
+# range.var <- list() # Range variable [lat,lon,time]
+# range.var$lat <- c(10, 70)
+# range.var$lon <- c(-180, -80)
+#range.var$time <- c("2016-04-30", "2016-04-30")
+#
+## Subset selection:
+#tbl.subset <- get_table(con, table.name, sel.var, range.var)
+#head(tbl.subset)
+#
+# dbDisconnect(con)
+  write_csv(seaflow, "seaflow-many-cruise.csv")
+} else {
+  seaflow <- read_csv("seaflow-many-cruise.csv")
+}
+```
+
+Cruises
+```{r}
+unique(seaflow$cruise)
+```
+
+Gradients cruise:
+
+* 1 - KM1606
+* 2 - MGL1704
+* 3 - KM1906
+
+```{r}
+seaflow %>%
+  filter(cruise == "KM1906") %>%
+  ggplot(aes(x=lat,
+             y=prochloro_abundance)) +
+  geom_point()
+seaflow %>%
+  filter(cruise == "MGL1704") %>%
+  ggplot(aes(x=lat,
+             y=synecho_abundance)) +
+  geom_point()
+seaflow %>%
+  filter(cruise == "KOK1606") %>%
+  ggplot(aes(x=lat,
+             y=picoeuk_abundance)) +
+  geom_point()
+```
+
+Test analysis on a single species.
+```{r}
+seaflow %>%
+  filter(cruise %in% c("KOK1606", "MGL1704", "KM1906")) %>%
+  select(cruise, prochloro_abundance, synecho_abundance, picoeuk_abundance) %>%
+  rename(Pro = prochloro_abundance, Syn = synecho_abundance, Pico = picoeuk_abundance) %>%
+  pivot_longer(cols = Pro:Pico, names_to = "species", values_to="abundance") %>%
+  na.omit() %>%
+  filter(cruise =="KOK1606", species =="Pro") -> temp1 
+densityMclust(temp1$abundance) -> model1
+temp1 %>% ggplot(aes(x=abundance, stat(density))) +
+  geom_histogram() + 
+  geom_line(aes(y=predict(model1, what="dens")), color="blue")
+summary(model1)
+# predict(model1, what="cdens")
+predict(model1, what="z") %>% apply(1, function(x) which(x==max(x)))
+```
+
+Make models for three cruises and three species.
+```{r}
+#  densityMclust(imp_data$rho, G=1:4)
+seaflow %>%
+  filter(cruise %in% c("KOK1606", "MGL1704", "KM1906")) %>%
+  select(time, lat, cruise, prochloro_abundance, synecho_abundance, picoeuk_abundance) %>%
+  rename(Pro = prochloro_abundance, Syn = synecho_abundance, Pico = picoeuk_abundance) %>%
+  pivot_longer(cols = Pro:Pico, names_to = "species", values_to="abundance") %>%
+  na.omit() -> seaflow2
+seaflow2 %>%
+  #  slice(1:100) %>%
+  group_by(cruise, species) %>%
+  nest() %>%
+  mutate(fit = purrr::map(data, ~ densityMclust(log(.x$abundance), G=1:2))) -> z
+z %>%
+    mutate(density = purrr::map(fit,  ~ predict(.x, what="dens")) ,
+           cluster = purrr::map(fit, 
+                                ~ predict(.x, what="z") %>% 
+                                  apply(1, function(x) which(x==max(x))))) %>%
+    select(-fit) %>%
+    unnest(cols=c(data, density))  -> seaflow2
+```
+
+Plot histograms of abundance data and densities.
+```{r}
+seaflow2 %>% # filter(cruise =="KOK1606", species =="Pro") %>%
+  ungroup() %>%
+  mutate(species = fct_relevel(species, "Pro", "Syn")) %>%
+  ggplot(aes(x=log(abundance), stat(density))) +
+  geom_histogram() +
+  geom_line(aes(y=density), color="blue") +
+  labs(title="",
+       x="Log abundance (cells/µL)",
+       y="Frequency") +
+  facet_grid(species ~ fct_inorder(cruise), scales="free_y")
+```
+
+Plot abundance of each species vs latitude (or time) and color points by classification to illustrate breakpoints.
+
+
+
+
