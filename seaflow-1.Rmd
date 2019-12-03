@@ -1,148 +1,278 @@
 ---
-title: "CMAP seaflow"
-author: "Andrew Irwin"
-date: "16/10/2019"
-output: html_document
+title: "CMAP seaflow abundance segementation by breakpoints"
+author: "Andrew Irwin, a.irwin@dal.ca"
+date: "December 2019"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: paper  # journal, paper, lumen
+    highlight: tango
+    df_print: paged  # paged, kable, default
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE, message=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-```
-
-## setup
-
-```{r}
-library(DBI)
-library(odbc)
 library(tidyverse)
-library(dbplyr)
 library(mclust)
-```
-
-Unstall cmap4r
-```{r}
 # devtools::install_github("simonscmap/cmap4r/package/cmap4r")
 library(cmap4r)
+# library(patchwork)
 ```
 
-Read some data
-```{r}
-downloadData = FALSE
-if (downloadData) {   
-# con <- connect_cmap(Driver = "libtdsodbc.so", reset=TRUE) # need credentials
-# airwin / diatom1355! -- not working
-# how to use API key?
+## Introduction
 
-table.name <- "tblSeaFlow" # table name
-# temporary solution, pending revision to code
-seaflow <- cmap4r:::query(paste("select * from", table.name), "de2c7320-f06c-11e9-aaf9-bbb395927ec4")
+On the three Gradients cruises we have observed rapid changes in the abundance (cells / µL) of _Prochlorococcus_, _Synechococcus_, and picoeukaryotes along the cruise tracks. We would like a clearly-defined procedure for defining where these changes occur. Many methods can be used to define these break points, for example, by looking at changes in the first and second derivatives, or by statistical tests to fit a piecewise constant or linear function to the abundance data. The derivative method runs into some difficulties due to small-scale variability in the abundance data; it's not clear how much to smooth the data before computing derivatives and its possible to either detect changes that we would like to ignore or smooth out changes that appear visually important. Other problems arise with the statistical fitting of piecewise functions.
 
-# tbl.colClass <- tbl_vartpe(con, table.name)
-# sel.var <- ""
-# range.var <- tbl_spacetime_range(con, table.name)
+In this report I demonstrate an approach which ignores the temporal and spatial dimension of the data. We decompose the distribution of log abundances into a set of Gaussian distributions. The idea is that prevaling conditions in different parts of the cruise track will lead to high or low abundance, and various levels in between, of each taxonomic group. Abundance of any one species is generally log-normal, but if conditions change markedly, we observe large increases or decreases in the abudance. The goal of this method is to isolate those different states by decomposing abundance into a set of log normal distributions. The method requires the selection of the number of peaks, but there are statistical tools that can be used to select this number automatically. In general I've found that a user-imposed smaller than "optimal" number of peaks is easier to interpret and describes the breaks observed visually quite well.
 
+## Goals
 
-# range.var <- list() # Range variable [lat,lon,time]
-# range.var$lat <- c(10, 70)
-# range.var$lon <- c(-180, -80)
-#range.var$time <- c("2016-04-30", "2016-04-30")
-#
-## Subset selection:
-#tbl.subset <- get_table(con, table.name, sel.var, range.var)
-#head(tbl.subset)
-#
-# dbDisconnect(con)
-  write_csv(seaflow, "seaflow-many-cruise.csv")
-} else {
-  seaflow <- read_csv("seaflow-many-cruise.csv")
-}
-```
+* Demonstrate the idea of decomposing the distribution of log abundance into a sequence of Normal (Gaussian) peaks.
+* Perform this decomposition on the three taxa from the three Gradients cruises
+* Quantify the location of the breakpoints along the ship transect (as latitude and time, with separate results for northbound and southbound trips)
 
-Cruises
-```{r}
-unique(seaflow$cruise)
-```
+## Data
 
-Gradients cruise:
+We obtain the data from CMAP and store a local copy. If you set `downloadData` to false, you will need a local copy of the file; if true, then you will need an API key for CMAP.
 
-* 1 - KM1606
+Pick out just the Gradients cruises
+
+* 1 - KOK1606
 * 2 - MGL1704
 * 3 - KM1906
 
 ```{r}
-seaflow %>%
-  filter(cruise == "KM1906") %>%
-  ggplot(aes(x=lat,
-             y=prochloro_abundance)) +
-  geom_point()
-seaflow %>%
-  filter(cruise == "MGL1704") %>%
-  ggplot(aes(x=lat,
-             y=synecho_abundance)) +
-  geom_point()
-seaflow %>%
-  filter(cruise == "KOK1606") %>%
-  ggplot(aes(x=lat,
-             y=picoeuk_abundance)) +
-  geom_point()
+downloadData = FALSE
+if (downloadData) {
+  # mq = "select * from tblSeaFlow"  # All the cruises
+  mq = "select * from tblSeaFlow where cruise in ( 'KM1513', 'KOK1606', 'MGL1704', 'KM1906')"
+  # mq = "select * from tblSeaFlow where cruise in ( 'KOK1606', 'MGL1704', 'KM1906')" 
+  # this query leads to many NAs and R guessing incorrectly that columns
+  # are logical variables instead of double numbers; kludge is to add a cruise
+  seaflow = exec_manualquery(mq)
+  seaflow %>% filter(cruise != "KM1513") -> seaflow
+  write_csv(seaflow, "seaflow-many-cruise-2019-12-03.csv")
+} else {
+  seaflow <- read_csv("seaflow-many-cruise-2019-12-03.csv", col_types ="Tddcddddddddddddddddddddd")
+}
 ```
 
-Test analysis on a single species.
+Plot the abundance data to see what we've got.
+
 ```{r}
 seaflow %>%
-  filter(cruise %in% c("KOK1606", "MGL1704", "KM1906")) %>%
-  select(cruise, prochloro_abundance, synecho_abundance, picoeuk_abundance) %>%
-  rename(Pro = prochloro_abundance, Syn = synecho_abundance, Pico = picoeuk_abundance) %>%
-  pivot_longer(cols = Pro:Pico, names_to = "species", values_to="abundance") %>%
+  group_by(cruise) %>% 
+  mutate(cruise_time = time - min(time)) %>%
+  ungroup() %>%
+  select(time, cruise_time, lat, cruise, ends_with("abundance")) %>%
+  pivot_longer(cols = ends_with("abundance"), names_to = "taxon", values_to = "abundance") %>%
+  separate(taxon, into = c("spp", NA), sep="_") %>%
+  filter(spp %in% c("prochloro", "synecho", "picoeuk")) %>%
+  mutate(spp = fct_relevel(spp, "prochloro", "synecho"),
+         cruise = fct_relevel(cruise, "KOK1606", "MGL1704")) -> seaflow_subset
+seaflow_subset %>%
+  ggplot(aes(x=cruise_time/86400,
+             y=log10(abundance))) +
+  geom_point(size=0.25, shape=20) +
+  facet_grid(spp ~ cruise, scales="free") +
+  labs(x = "Cruise time (days)", 
+       y = "log10 abundance (cells/µL)")
+seaflow_subset %>%
+  ggplot(aes(x=lat,
+             y=abundance)) +
+  geom_point(size=0.25, shape=20) +
+  facet_grid(spp ~ cruise, scales = "free" ) +
+  labs(x = "Latitude (°N)", 
+       y = "Abundance (cells/µL)")
+```
+
+## Developing the analysis
+
+Here I work throught the analysis on a single species for a single cruise.
+
+```{r}
+seaflow_subset %>%
   na.omit() %>%
-  filter(cruise =="KOK1606", species =="Pro") -> temp1 
-densityMclust(temp1$abundance) -> model1
+  filter(cruise == "KOK1606", spp == "prochloro") -> temp1
+temp1 %>%
+  pull(abundance) %>%
+  densityMclust(., G=1:2, model=c("E", "V")) -> model1  # G selects the choice for number of clusters to consider
 temp1 %>% ggplot(aes(x=abundance, stat(density))) +
   geom_histogram() + 
   geom_line(aes(y=predict(model1, what="dens")), color="blue")
-summary(model1)
+summary(model1, parameters = TRUE)
+plot(model1, what="BIC")  # letter describes model choice: E is equal variance, V is unequal variance
 # predict(model1, what="cdens")
-predict(model1, what="z") %>% apply(1, function(x) which(x==max(x)))
+# predict(model1, what="z") %>% apply(1, function(x) which(x==max(x)))
 ```
 
-Make models for three cruises and three species.
+Plot the abundance along the cruise track coloring the data by cluster number. Strange things can happen if you use the "wrong" number of clusters. For example, if you repeat this analysis using 3 clusters (`G=1:3`) you will get a "better" model (larger BIC), but cluster 2 and 3 will overlap, one narow and one wide.
+
 ```{r}
-#  densityMclust(imp_data$rho, G=1:4)
-seaflow %>%
-  filter(cruise %in% c("KOK1606", "MGL1704", "KM1906")) %>%
-  select(time, lat, cruise, prochloro_abundance, synecho_abundance, picoeuk_abundance) %>%
-  rename(Pro = prochloro_abundance, Syn = synecho_abundance, Pico = picoeuk_abundance) %>%
-  pivot_longer(cols = Pro:Pico, names_to = "species", values_to="abundance") %>%
-  na.omit() -> seaflow2
-seaflow2 %>%
-  #  slice(1:100) %>%
-  group_by(cruise, species) %>%
-  nest() %>%
-  mutate(fit = purrr::map(data, ~ densityMclust(log(.x$abundance), G=1:2))) -> z
-z %>%
-    mutate(density = purrr::map(fit,  ~ predict(.x, what="dens")) ,
-           cluster = purrr::map(fit, 
-                                ~ predict(.x, what="z") %>% 
-                                  apply(1, function(x) which(x==max(x))))) %>%
-    select(-fit) %>%
-    unnest(cols=c(data, density))  -> seaflow2
+temp1 %>%
+  mutate(cluster = predict(model1, what="z") %>% apply(1, function(x) which(x==max(x)))) %>%
+  arrange(cruise_time) %>%  # important for the data to be in chronological order before smoothing with a running median
+  mutate(cluster_median = runmed(cluster, 31)) -> temp2  # 3 removes single isolated changes
+temp2 %>%
+  ggplot(aes(x=lat, y=abundance, color = factor(cluster_median))) +
+  geom_point()
+temp2 %>% 
+  ggplot(aes(x=time, y=abundance, color = factor(cluster_median))) +
+  geom_point()
+temp2 %>% 
+  ggplot(aes(x=time, y=lat, color = factor(cluster_median))) +
+  geom_point()
 ```
 
-Plot histograms of abundance data and densities.
+How to find the location of the breakpoints? Perform a running-median smooth on cluster number, picking the majority winner, and find where those change using first-order differences. Plot full cruise and a zoom in on the area of interest.
+
 ```{r}
-seaflow2 %>% # filter(cruise =="KOK1606", species =="Pro") %>%
-  ungroup() %>%
-  mutate(species = fct_relevel(species, "Pro", "Syn")) %>%
-  ggplot(aes(x=log(abundance), stat(density))) +
-  geom_histogram() +
-  geom_line(aes(y=density), color="blue") +
-  labs(title="",
-       x="Log abundance (cells/µL)",
-       y="Frequency") +
-  facet_grid(species ~ fct_inorder(cruise), scales="free_y")
+temp2 %>% filter(cluster_median != lag(cluster_median)) %>%
+  group_by( floor(cruise_time / 600)) %>%
+  # group_by(floor(lat*10)) %>%
+  summarize(cruise_time = mean(cruise_time), time = mean(time), lat = mean(lat)) %>%
+  select(time, cruise_time, lat) -> temp3
+temp2 %>%
+  ggplot(aes(x=lat, y=abundance, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = lat))
+temp2 %>%
+  ggplot(aes(x=lat, y=abundance, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = lat)) + xlim(36, 37.5)
+temp2 %>%
+  ggplot(aes(x=cruise_time, y=abundance, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = cruise_time))
+temp2 %>%
+  ggplot(aes(x=cruise_time, y=abundance, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = cruise_time)) + xlim(540000, 730000)
+temp2 %>%
+  ggplot(aes(x=cruise_time, y=lat, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = cruise_time))
+temp2 %>%
+  ggplot(aes(x=cruise_time, y=lat, color = factor(cluster_median))) +
+  geom_point() +
+  geom_vline(data=temp3, aes(xintercept = cruise_time)) + xlim(540000, 730000)
 ```
 
-Plot abundance of each species vs latitude (or time) and color points by classification to illustrate breakpoints.
+The location of the breaks.
+```{r}
+temp3
+```
+
+## All the cruises
+
+Write functions to perform clustering, find breakpoints, and make summary table.
+
+```{r}
+find_clusters = function(select_cruise = "KOK1606", select_spp = "prochloro", G = 1:2, seaflow = seaflow_subset) {
+  seaflow_subset %>%
+    filter(cruise == select_cruise, spp == select_spp) %>%
+    mutate(cruise_time = time - min(time)) %>%
+    na.omit() -> temp1
+  temp1 %>%  pull(abundance) %>% 
+    densityMclust(., G=G, model=c("E", "V")) -> model1
+  temp1 %>%
+    mutate(cluster = predict(model1, what="z") %>% apply(1, function(x) which(x==max(x)))) %>%
+    arrange(time) %>%  # important for the data to be in chronological order before smoothing with a running median
+    mutate(cluster_median = factor(runmed(cluster, 151))) -> temp2  # 3 removes single isolated changes
+  temp2
+}
+find_breaks = function(clusters) {
+  clusters %>% filter(cluster_median != lag(cluster_median)) %>%
+    group_by( floor(cruise_time / (60*60))) %>%  # cluster any breaks within the same hour (approximately, definitely half hour)
+    # group_by(floor(lat*10)) %>%
+    summarize(time = mean(time), lat = mean(lat)) %>%
+    select(time, lat)
+}
+make_plots = function(cruise = "KOK1606", species = "prochloro", G = 1:2, seaflow = seaflow_subset) {
+  temp1 <- find_clusters(cruise, species, G, seaflow)
+  temp2 <- find_breaks(temp1)
+  p1 <- ggplot(temp1, aes(x=lat, y=abundance, color = factor(cluster_median))) +
+           geom_point() +
+           geom_vline(data=temp2, aes(xintercept = lat))
+  p2 <- ggplot(temp1, aes(x=time, y=abundance, color = factor(cluster_median))) +
+           geom_point() +
+           geom_vline(data=temp2, aes(xintercept = time))
+  p3 <- ggplot(temp1, aes(x=time, y=lat, color = factor(cluster_median))) +
+           geom_point() +
+           geom_vline(data=temp2, aes(xintercept = time))
+  # p1 + p2 + p3
+  print(p1)
+  print(p2)
+  print(p3)
+  temp2
+}
+# find_clusters(cruise="MGL1704", species = "prochloro") %>% find_breaks()
+```
+
+## Gradients 1
+
+
+### Prochlorococcus
+
+```{r}
+make_plots("KOK1606", "prochloro")
+```
+
+### Synechococcus
+
+```{r}
+make_plots("KOK1606", "synecho", G=1:3)
+```
+
+### Picoeukaryotes
+
+```{r}
+make_plots("KOK1606", "picoeuk")
+```
+
+## Gradients 2
+
+### Prochlorococcus
+
+```{r}
+make_plots("MGL1704", "prochloro")
+```
+
+### Synechococcus
+
+```{r}
+make_plots("MGL1704", "synecho")
+```
+
+### Picoeukaryotes
+
+```{r}
+make_plots("MGL1704", "picoeuk")
+```
+
+## Gradients 3
+
+
+### Prochlorococcus
+
+```{r}
+make_plots("KM1906", "prochloro")
+```
+
+### Synechococcus
+
+```{r}
+make_plots("KM1906", "synecho")
+```
+
+### Picoeukaryotes
+
+```{r}
+make_plots("KM1906", "picoeuk")
+```
+
 
 
 
